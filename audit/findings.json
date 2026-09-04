@@ -1,0 +1,538 @@
+{
+  "project": "JunoswapV3Staker",
+  "type": "Staking / Liquidity mining (Uniswap V3 concentrated-liquidity positions)",
+  "chain": "Any EVM chain (target chain not declared in the repository)",
+  "commit": "not a git repository — audited from the working tree at C:\\Users\\supis\\Documents\\GitHub\\v3staker\\juno",
+  "date": "2026-09-04",
+  "auditor": "Claude Code (Opus 5) — smartcontract-audit skill",
+  "scope": [
+    "contracts/JunoswapV3Staker.sol (364 lines)",
+    "contracts/interfaces/IJunoswapV3Staker.sol (153 lines)",
+    "contracts/libraries/RewardMath.sol (54 lines)",
+    "contracts/libraries/IncentiveId.sol (12 lines)",
+    "contracts/libraries/NFTPositionInfo.sol (47 lines)",
+    "contracts/libraries/TransferHelperExtended.sol (39 lines)"
+  ],
+  "summary": "JunoswapV3Staker is a fork of Uniswap's `v3-staker` (v1.0.2) that replaces the reward model. Upstream measures a position against the liquidity-seconds of the *whole pool*, so an incentive on a pool where only a slice of the TVL is staked pays out only that slice of its budget. The fork replaces this with a fixed drip of `totalReward / duration` shared among the *staked* positions via a `rewardPerLiquidityX128` accumulator, then scales each payout down by the fraction of the stake's life the position spent in range. Everything else — access control, deposit custody, the incentive key, the transfer helpers — is upstream, unchanged.\n\nThe access-control and custody surface is clean. There is no owner, no admin, no upgrade path, no pause and no sweep function: `createIncentive` is permissionless and self-funding, every state-changing function checks `deposits[tokenId].owner` or `msg.sender`, and checks-effects-interactions is respected on both token-moving paths. Liquidity-provider **principal is never at risk**: the LP NFT comes back on a path that touches only the position manager and the pool, and we could not construct a state in which that path reverts. Arithmetic conserves — payouts round down, the accumulator is bounded by the `type(uint128).max` reward cap, and no denominator can reach zero.\n\nThe findings are all in the new reward model, and all three High-severity ones share one root: **in-range status is applied as a post-hoc multiplier on the payout instead of being part of the accumulator's denominator.** That single choice produces (H-01) a payout ratio whose numerator keeps growing after `endTime` while its denominator stops there, letting a position that was never in range during the incentive collect its whole share by waiting; (H-02) out-of-range liquidity that dilutes every honest staker while being paid nothing, so a position costing 0.0000019 tokens cuts a real LP's share of the budget to 8.7e-14 of it; and (H-03) the permissionless out-of-range eviction added to work around H-02, which keys on a spot tick that a single swap can set and so becomes a tool for clearing every competing staker out of the incentive.\n\nThe value these findings move is always the reward budget, never LP principal, and in each case it lands with `key.refundee` or with an attacker rather than with the intended participants — which is precisely what the fork exists to fix.\n\nNo Critical findings. 3 High, 2 Medium, 1 Low, 1 Informational (bundled). Nine candidates were raised during the read and seven survived the refutation pass.\n\n---\n\n**Post-audit remediation.** Five of the seven findings were fixed in the same session and are marked Fixed below: H-01, H-02, H-03, M-02 and L-01 — every issue in roadmap tiers 0, 1 and 2. The contract compiles clean on solc 0.7.6 and the accounting model passes, extended from 8 cases to 12 to cover the fixed behaviour.\n\nOne correction worth recording, because it changed the fix: the first attempt at H-01 was the one-line clamp this report originally recommended, and the project's own model test 7 rejected it. The clamp is a sound lower bound but loosens by a second per second of delay, so it zeroed an honest staker who merely unstook late — trading a leak against the refundee for a leak against LPs. The shipped fix pairs the clamp with `finalizeStake`, a permissionless, batchable call that freezes a stake's in-range measurement at `endTime` and makes the discount vanish. The recommendation text in H-01 has been updated to match what was actually built.\n\n**M-01 was left open on purpose** — a minimum range width is a product decision, not a bug. I-01 remains open; none of it is a defect.\n\nThe fixes are reviewed only against this report's own model and the compiler. They have **not** been tested against a real Uniswap V3 pool, and the fork tests, invariant tests and Slither run in roadmap tier 3 are still outstanding — `finalizeStake` and the two new `_stakeToken` guards are new code paths that no on-chain test exercises.",
+  "trust_assumptions": [
+    "**Not audited: the compiler.** solc 0.7.6 with optimizer `runs: 1000000` was taken as correct. Note that 0.7.6 has no checked arithmetic — every `+`, `-` and `*` in this contract wraps silently rather than reverting. See L-01.",
+    "**Not audited: Uniswap V3 core and periphery.** `UniswapV3Pool` (`slot0`, `snapshotCumulativesInside`), `NonfungiblePositionManager`, `PoolAddress`, `FullMath`, `TransferHelper` and `Multicall` are assumed to behave as the pinned `@uniswap/v3-core@1.0.0` / `@uniswap/v3-periphery@^1.0.1` releases do. `PoolAddress.POOL_INIT_CODE_HASH` is assumed to match the factory actually deployed on the target chain — if this is deployed against a re-compiled V3 factory, `NFTPositionInfo.getPositionInfo` computes the wrong pool address and every `stakeToken` reverts with 'token pool is not the incentive pool'.",
+    "**Not audited: OpenZeppelin 3.4.1-solc-0.7-2** (`Address`, `IERC721Receiver`).",
+    "**Not audited: reward tokens.** Incentive creation is permissionless, so any ERC-20 can become a reward token. The report assumes a standard, non-rebasing, non-fee-on-transfer, non-blocklisting, non-admin-controlled ERC-20 except where M-02 states otherwise.",
+    "**Not audited: the deployment.** There is no deployment script, no network configuration in `hardhat.config.js`, and no chain declared anywhere in the repository. `maxIncentiveStartLeadTime` and `maxIncentiveDuration` are constructor arguments that were not available; every statement about incentive timing assumes sane values for them. If the target is KUB Chain / Bitkub, KAP-20 reward tokens carry `adminTransfer` / `adminApprove` powers that let the token developer move balances out from under this contract — that would need its own review against `kub.md`.",
+    "**Not audited: off-chain components.** No front end, keeper, indexer or refundee automation was in scope. H-01 and H-03 both assume nobody is running a keeper; if one is, their likelihood drops but the findings stand.",
+    "**No on-chain tests exist.** `test/reward-model.test.js` is a JavaScript re-implementation of the accounting, not a test of the compiled bytecode. Nothing in this repository exercises the contract against a real Uniswap V3 pool, and `snapshotCumulativesInside` behaviour in particular is entirely untested.",
+    "**No static analysis was run.** `slither` and a standalone `solc` are not installed on this machine. This is a genuine coverage gap, not a formality — see the method section."
+  ],
+  "sections": [
+    {
+      "title": "Method, tooling and reproducibility",
+      "body": "Run at **effort: high** on **claude-opus-5**, in a single context with the catalogs and the contract loaded together rather than split across subagents. Every in-scope file was read end to end; nothing was sampled.\n\nDimensions covered: access control; core protocol logic (the deposit → stake → accrue → unstake → claim state machine); economics and value extraction; low-level Solidity safety (arithmetic, casts, reentrancy, external calls, gas); and domain mathematics (the accumulator and the Uniswap tick/liquidity relations).\n\n**Tooling actually run**, so a re-run can be compared against this:\n\n- `scripts/scan.py contracts` — recon over the external surface, loops, narrowing casts and risk patterns.\n- `npx hardhat compile` — solc 0.7.6, optimizer enabled, `runs: 1000000`, `bytecodeHash: none`. Compiles clean.\n- `node test/reward-model.test.js` — the project's own accounting model. Passes.\n- A PoC script driving that same model through the cases its suite does not cover. This produced the numbers in H-01 and H-02.\n- `diff` against `Uniswap/v3-staker` tag **v1.0.2** fetched from GitHub, with identifiers normalised. This is the fork diff the workflow requires; it is summarised in the next section.\n- Closed-form computation for the range-width and dilution tables, using the standard Uniswap V3 amounts-for-liquidity relations and `Tick.tickSpacingToMaxLiquidityPerTick`.\n\n**Not run:** Slither and solc are not installed here, so no static-analysis pass was performed and no findings were imported from one. The recommendation in the roadmap to run Slither and a Foundry invariant suite is therefore load-bearing, not boilerplate.\n\n**Not a git repository**, so no commit hash could be recorded. Pin one before acting on this report.",
+      "table": {
+        "headers": [
+          "Stage",
+          "Result"
+        ],
+        "rows": [
+          [
+            "Candidates raised during the read",
+            "9"
+          ],
+          [
+            "Survived the refutation pass",
+            "7"
+          ],
+          [
+            "Distinct after de-duplication",
+            "7"
+          ],
+          [
+            "Dropped — retroactive dilution by a same-block stake/unstake",
+            "Refuted: `_accrue` settles the accumulator *before* `stakedLiquidity` changes, so liquidity added at time T cannot dilute any interval before T"
+          ],
+          [
+            "Dropped — permanent revert in `snapshotCumulativesInside` bricking `unstakeToken`",
+            "Refuted: the staked position keeps its own ticks initialised, and `decreaseLiquidity`/`burn` are `isAuthorizedForToken`-gated on an NFT this contract owns and never approves (ERC-721 transfer clears any prior per-token approval)"
+          ]
+        ]
+      }
+    },
+    {
+      "title": "Fork diff — what changed against Uniswap v3-staker v1.0.2",
+      "body": "Most forks are exploited because of a small deviation from the original, so this was the first pass. Everything outside the reward model is upstream verbatim: `createIncentive`'s timing guards, `endIncentive`, `onERC721Received` (including the `data.length == 160` single-key heuristic), `transferDeposit`, `withdrawToken`, `stakeToken`'s ownership check, `claimReward`, `IncentiveId`, `NFTPositionInfo` and `TransferHelperExtended` are unchanged.\n\nSix deviations. Deviations 1 and 2 together *are* the fork's purpose — the findings are not that the fork changed the model, but that the changed model has holes upstream did not.",
+      "table": {
+        "headers": [
+          "#",
+          "Deviation",
+          "Consequence"
+        ],
+        "rows": [
+          [
+            "1",
+            "`Incentive` gains `totalReward`, `rewardPerLiquidityX128`, `stakedLiquidity`, `lastUpdateTime`; loses `totalSecondsClaimedX128`",
+            "The drip is now fixed at `totalReward / duration` and shared among stakers only. This is the intended change and it works."
+          ],
+          [
+            "2",
+            "`RewardMath` rewritten: `secondsPerLiquidityInside` (normalised by the pool's *in-range* liquidity) replaced by an accumulator over `stakedLiquidity`, plus a separate `secondsInside / stakedSeconds` multiplier",
+            "**H-01, H-02.** Upstream's measure is in-range-weighted by construction; the fork's denominator counts out-of-range liquidity, and its numerator is capped differently from its denominator."
+          ],
+          [
+            "3",
+            "`unstakeToken` permission relaxed — upstream is owner-only before `endTime`, the fork adds `|| _isOutOfRange(...)`",
+            "**H-03.** A new permissionless eviction keyed on a spot tick."
+          ],
+          [
+            "4",
+            "New `require(key.endTime <= type(uint32).max)`; `stakeTime` and `secondsInsideInitial` stored as `uint32`",
+            "**I-01.** Incentives cannot end after 2106-02-07."
+          ],
+          [
+            "5",
+            "New `require(incentive.totalReward + reward <= type(uint128).max)`",
+            "**L-01.** The addition is unchecked in 0.7.6, so the guard this deviation introduces can itself be wrapped past."
+          ],
+          [
+            "6",
+            "`Stake` no longer packs liquidity into `uint96` + an overflow slot; `stakes` is now a public mapping of a 3-slot struct",
+            "A correctness improvement — upstream's packing is a known wart. Costs one extra `SSTORE` per stake (~20k gas). Not a finding."
+          ]
+        ]
+      }
+    },
+    {
+      "title": "Roles, permissions and external calls",
+      "body": "**There is no privileged role in this contract.** No `owner`, no `Ownable`, no roles, no `initialize`, no proxy, no pause, no sweep, no migrator, no upgrade path. The four immutables (`factory`, `nonfungiblePositionManager`, `maxIncentiveStartLeadTime`, `maxIncentiveDuration`) are set in the constructor and can never change.\n\nThat removes the entire centralization catalog from `staking.md` and `methodology.md`, and it is worth stating plainly: there is no key whose compromise costs anyone anything, and no admin who can rug. The closest thing to a privileged party is `key.refundee`, and it is not privileged at all — it is a field of the incentive key, fixed at creation and hashed into the incentive id. `endIncentive` may be called by anyone but always pays that address.\n\n**External-call inventory** — all to the pinned Uniswap contracts or the incentive's own reward token: `nonfungiblePositionManager.positions` (view, ×2), `nonfungiblePositionManager.safeTransferFrom` (in `withdrawToken`, after state is cleared), `pool.snapshotCumulativesInside` (view, ×3), `pool.slot0` (view), and `rewardToken.transfer` / `transferFrom` via `TransferHelperExtended`. No call is made inside a loop, none forwards a fixed gas stipend, and no `require(success)` sits on a call an untrusted party controls.\n\n**Reentrancy:** there is no `nonReentrant` modifier anywhere, and none is needed. The two paths that hand control to an external party — `withdrawToken`'s `safeTransferFrom` and `claimReward`'s `transfer` — both write state before the call (`delete deposits[tokenId]`, `rewards[...] -= reward`). Re-entering `stakeToken` from an ERC-721 receiver hook finds `deposits[tokenId].owner == address(0)` and reverts. A malicious reward token re-entering `claimReward` finds its balance already zeroed. `onERC721Received` is gated to the position manager.",
+      "table": {
+        "headers": [
+          "Function",
+          "Who can call it",
+          "Guard",
+          "Settles the accumulator first?"
+        ],
+        "rows": [
+          [
+            "`createIncentive`",
+            "anyone",
+            "must pre-date `startTime`; `reward > 0`; duration and lead-time bounds",
+            "n/a — no stake can exist yet, except at `startTime` itself where `_accrue` is a no-op"
+          ],
+          [
+            "`endIncentive`",
+            "anyone (always pays `key.refundee`)",
+            "`block.timestamp >= endTime`, `numberOfStakes == 0`, `refund > 0`",
+            "n/a — nothing staked"
+          ],
+          [
+            "`onERC721Received`",
+            "position manager only",
+            "`msg.sender == nonfungiblePositionManager`",
+            "yes, via `_stakeToken`"
+          ],
+          [
+            "`stakeToken`",
+            "deposit owner only",
+            "`deposits[tokenId].owner == msg.sender`",
+            "**yes** — `_accrue` before `stakedLiquidity +=`"
+          ],
+          [
+            "`unstakeToken`",
+            "deposit owner; **anyone** after `endTime` or while out of range",
+            "see H-03",
+            "**yes** — `_accrue` before `stakedLiquidity -=`"
+          ],
+          [
+            "`transferDeposit`",
+            "deposit owner only",
+            "non-zero recipient",
+            "not needed — touches neither liquidity nor the accumulator"
+          ],
+          [
+            "`withdrawToken`",
+            "deposit owner only",
+            "`numberOfStakes == 0`, `to != address(this)`",
+            "not needed — cannot be staked"
+          ],
+          [
+            "`claimReward`",
+            "anyone, for their own balance only",
+            "pays from `rewards[token][msg.sender]`",
+            "not needed — reads an already-settled balance"
+          ],
+          [
+            "`getRewardInfo`",
+            "anyone (view)",
+            "stake must exist",
+            "simulates `_accrue` on a memory copy"
+          ]
+        ]
+      }
+    },
+    {
+      "title": "Value flow — the money map",
+      "body": "Every unit of reward token entering this contract leaves by one of exactly two doors, and the accounting between them conserves.\n\n**In.** `createIncentive` pulls `reward` from the creator and credits both `incentive.totalReward` (the drip basis, effectively frozen once the incentive starts) and `incentive.totalRewardUnclaimed` (the live pot).\n\n**Accrual.** `_accrue` grows `rewardPerLiquidityX128` by `totalReward × dt × 2^128 / (duration × stakedLiquidity)` for each interval between stake/unstake events, and only while `stakedLiquidity > 0`. Seconds during which nothing is staked accrue nothing — by design, so a latecomer cannot snipe the idle period. This is correct, and the project's own model covers it (case 8).\n\n**Out, door 1 — stakers.** `unstakeToken` converts a stake's accumulator delta into `rewards[rewardToken][deposit.owner]` and decrements `totalRewardUnclaimed` by the same amount; `claimReward` then transfers it out. Both `FullMath.mulDiv` calls round **down**, and `computeRewardAmount` clamps at `totalRewardUnclaimed`, so the sum of all payouts can never exceed `totalReward`. Conservation was verified algebraically (each staker's share is `l / stakedLiquidity` of the drip, and the shares sum to one) and by running the project's model.\n\n**Out, door 2 — the refundee.** `endIncentive` sends whatever is left of `totalRewardUnclaimed` to `key.refundee`. Three things end up here: reward for seconds when nothing was staked, reward forfeited by out-of-range uptime, and rounding dust.\n\n**Where the findings bite.** Door 2 is far wider than the design intends: H-02 shows it takes the whole budget in the adversarial case and a proportional slice of it in ordinary operation, while H-01 is the opposite leak — a staker taking from door 2 what it did not earn. Neither moves LP principal; the LP NFT is separate custody with its own exit.",
+      "table": {
+        "headers": [
+          "Slice",
+          "Where it ends up",
+          "Sized by"
+        ],
+        "rows": [
+          [
+            "Reward for seconds with a staker in range",
+            "`rewards[token][owner]` → the staker",
+            "`l / stakedLiquidity`, times in-range fraction"
+          ],
+          [
+            "Reward for seconds with a staker out of range",
+            "`totalRewardUnclaimed` → `key.refundee`",
+            "**H-02** — unbounded, and never redistributed to the in-range stakers"
+          ],
+          [
+            "Reward for seconds with nothing staked",
+            "`totalRewardUnclaimed` → `key.refundee`",
+            "Intended; covered by model test case 8"
+          ],
+          [
+            "Rounding dust",
+            "`totalRewardUnclaimed` → `key.refundee`",
+            "A few wei — both `mulDiv` calls round down"
+          ],
+          [
+            "Protocol fee",
+            "**none exists**",
+            "The contract takes nothing. No fee path, visible or folded into a quote."
+          ]
+        ]
+      }
+    },
+    {
+      "title": "Loop and gas analysis",
+      "body": "There is exactly **one** loop in the codebase.\n\n`JunoswapV3Staker.sol:163` — `for (uint256 i = 0; i < keys.length; i++)` in `onERC721Received`, iterating the incentive keys a depositor asked to stake into in one transfer. The bound is controlled by *the caller, for their own token only*: an over-long array makes the caller's own `safeTransferFrom` run out of gas and revert, harming nobody else. No other user's funds, and no function anyone else needs, depends on this loop terminating. **Verdict: safe, not a finding.** It is upstream code, unchanged.\n\nThere is no loop over stakers, positions, pools or reward tokens anywhere. The `rewardPerLiquidityX128` accumulator is exactly the O(1)-per-user structure `gas.md` asks for, and payouts are pull-based via `rewards[token][owner]` + `claimReward`. Both structural liveness bugs that catalog warns about — push payments in a loop, unbounded iteration in a required function — are absent by construction.\n\n**Gas as a griefing surface** appears not in a loop but in the eviction asymmetry behind H-02 and H-03: an attacker can stake `k` dust positions in one `multicall`, while clearing them costs `k` separate `unstakeToken` transactions. That is the only place in this contract where one party can make another party's necessary work grow, and on a cheap-gas chain it is affordable to sustain indefinitely.\n\n**Deployment size** is not a concern — 364 lines with no heavy inlined libraries, far under the EIP-170 limit.\n\nNo gas *optimizations* are reported. The contract is already tight; the one place it spends more than upstream (deviation 6, ~20k extra per stake for the unpacked `Stake` struct) buys correctness, and `gas.md` is explicit that a bug introduced by a gas tweak is not a saving."
+    },
+    {
+      "title": "Liveness — the seven positive checks",
+      "body": "`arithmetic.md` requires every audited contract to answer these explicitly. This one answers **yes to six of seven**, and the seventh is a deliberate trade-off rather than a defect.\n\nThe headline: **an LP can always get their NFT back.** `unstakeToken` → `withdrawToken` touches only the pool (two views) and the position manager (one `safeTransferFrom`). It reads no oracle, needs no admin, cannot be paused, and does not touch the reward token at all — so even a completely broken reward token cannot trap an NFT. We tried to construct a state in which that path reverts and could not.",
+      "table": {
+        "headers": [
+          "#",
+          "Check",
+          "Answer"
+        ],
+        "rows": [
+          [
+            "1",
+            "Can every user retrieve their principal on a path touching no external contract but the asset itself?",
+            "**Yes.** `unstakeToken` then `withdrawToken`, hitting only `UniswapV3Pool` (views) and `NonfungiblePositionManager`. The reward token is not on the principal path."
+          ],
+          [
+            "2",
+            "Is there a state where that path reverts?",
+            "**No state found.** Four candidate reverts were each chased down. `snapshotCumulativesInside` needs both ticks initialised, and the staked position itself keeps them so — nobody else can burn it, because `decreaseLiquidity` is `isAuthorizedForToken` on an NFT this contract owns and never approves, and ERC-721 transfer clears any approval set before the deposit. `rewardPerLiquidityX128 - rewardPerLiquidityInitialX128` cannot underflow: the accumulator is monotonic. `FullMath.mulDiv(delta, liquidity, Q128)` cannot exceed 2^256, because `stakedLiquidity >= stake.liquidity` holds for the whole life of a stake, bounding the result by `totalReward <= type(uint128).max`. `totalRewardUnclaimed -= reward` cannot underflow, because `computeRewardAmount` clamps to it."
+          ],
+          [
+            "3",
+            "Is every loop bounded by a constant, or by a value only an admin can grow?",
+            "**Yes** — the single loop is bounded by the caller's own calldata and affects only the caller."
+          ],
+          [
+            "4",
+            "Is every denominator provably non-zero at the point of division?",
+            "**Yes.** `duration * stakedLiquidity`: `duration >= 1` from `require(startTime < endTime)`, and both call sites guard `stakedLiquidity > 0`. `stakedSeconds`: guarded by `if (stakedSeconds == 0) return 0` at `RewardMath.sol:45`. `Q128` is a constant."
+          ],
+          [
+            "5",
+            "Does every narrowing cast use SafeCast, or have a proven bound?",
+            "**Bounded, not SafeCast'd.** All four were checked. `uint64(currentTime)` and `uint32(block.timestamp)` are bounded by `require(key.endTime <= type(uint32).max)`. The two `uint32(secondsInside - initial)` casts are intentional modular arithmetic on a Uniswap accumulator designed to wrap, and are correct in 0.7.6 — see the porting note in I-01."
+          ],
+          [
+            "6",
+            "Does every monotonic accumulator fit its type for the contract's intended lifetime?",
+            "**Yes — this was the sharpest arithmetic check in the review.** The sum of all `rewardPerLiquidityX128` increments over an incentive's life is bounded by `totalReward × 2^128`, which the `type(uint128).max` reward cap keeps strictly below 2^256. The bound is tight: it holds even in the worst case of a single wei of staked liquidity for the entire duration. The comment at line 109 is accurate. (`stakedLiquidity` is a separate matter — see L-01.)"
+          ],
+          [
+            "7",
+            "Is there an emergency withdrawal that skips reward accounting, external calls and oracle reads?",
+            "**No** — a deliberate trade-off rather than an oversight. Getting an NFT out requires `unstakeToken`, which runs the full reward computation. Because check 2 shows that computation cannot revert, the missing escape hatch costs nothing today. But it does mean LP principal sits behind reward math that must never revert, so any future change to `RewardMath` inherits that obligation. Better addressed with an invariant test than with a code change."
+          ]
+        ]
+      }
+    },
+    {
+      "title": "Quantified — how much of the budget actually reaches participants (H-02)",
+      "body": "**Method:** closed form, then confirmed by running the project's own `test/reward-model.test.js` accounting class with the inputs below. The result is structural rather than parameter-dependent: because an out-of-range position sits in the accumulator's denominator but is paid nothing, and its forfeited share is *not* redistributed, the fraction of the budget reaching stakers equals the liquidity-weighted in-range uptime of the staked set. Everything else returns to `key.refundee` through `endIncentive`.\n\nThis table needs no attacker. It is ordinary operation on any pool whose price moves — which is every pool.",
+      "table": {
+        "headers": [
+          "Liquidity-weighted in-range uptime of the staked set",
+          "Reaches stakers",
+          "Returned to the refundee"
+        ],
+        "rows": [
+          [
+            "100% (every staked position always in range)",
+            "100.0%",
+            "0.0%"
+          ],
+          [
+            "75%",
+            "75.0%",
+            "25.0%"
+          ],
+          [
+            "50% — e.g. two equal stakers, one always in range, one never",
+            "50.0%",
+            "50.0%"
+          ],
+          [
+            "25%",
+            "25.0%",
+            "75.0%"
+          ],
+          [
+            "10%",
+            "10.0%",
+            "90.0%"
+          ]
+        ],
+        "highlight": 1
+      }
+    },
+    {
+      "title": "Quantified — one dust position against a real staker (H-02, L-01)",
+      "body": "Same method, adversarial case. The honest staker holds `L = 1e21`, a realistic figure for a well-capitalised concentrated position. The attacker holds one single-tick position at `maxLiquidityPerTick`, placed far out of range so it is never paid — it exists only to occupy the denominator.\n\n`maxLiquidityPerTick = type(uint128).max / numTicks` per `Tick.tickSpacingToMaxLiquidityPerTick`, and Uniswap enforces it, so these are the true ceilings and not hypotheticals. Cost of the position: with `amount0 = L × (1/√a − 1/√b)` for a 60-wide range at the top of the tick range, **1.879e12 wei — 0.0000019 tokens at 18 decimals.** The whole attack is funded by dust.\n\nThe last column is the number of such positions needed to wrap `stakedLiquidity` past `uint128`, which is the L-01 scenario.",
+      "table": {
+        "headers": [
+          "Fee tier",
+          "Tick spacing",
+          "maxLiquidityPerTick",
+          "Honest staker's share of the budget",
+          "Positions to wrap uint128"
+        ],
+        "rows": [
+          [
+            "0.05%",
+            "10",
+            "1.9176e33",
+            "5.215e-13",
+            "177,456"
+          ],
+          [
+            "0.30%",
+            "60",
+            "1.1505e34",
+            "8.692e-14",
+            "29,576"
+          ],
+          [
+            "1.00%",
+            "200",
+            "3.8346e34",
+            "2.608e-14",
+            "8,874"
+          ]
+        ],
+        "highlight": 3
+      }
+    },
+    {
+      "title": "Quantified — reward per dollar by range width (M-01)",
+      "body": "**Method:** closed form. For a position of liquidity `L` around price `P` spanning a relative price width `W`, the deposited value in token1 terms is approximately `L × √P × W / 2`, so `L = 2V / (√P × W)`. Reward weight in this contract is `L` alone, so reward per unit of capital scales as `1 / W`. The reference is a ±10% range (`W = 0.2222`); the comparison is the tightest range each fee tier permits, `W = 1.0001^tickSpacing − 1`.\n\nThe last column answers the practical question: how much capital, posted at the minimum width, earns the same reward as $100,000 posted at ±10%.\n\nThis behaviour is **inherited from upstream** — Uniswap's own staker also weights by raw liquidity — so it is not a fork-introduced defect, and it is filed at Medium for that reason. It is reported because the contract's stated goal is that a launchpad's fixed reward reaches its participants, and at the 0.01% tier a $45 position collects what a $100,000 position collects.",
+      "table": {
+        "headers": [
+          "Fee tier",
+          "Tick spacing",
+          "Minimum width W",
+          "Reward per dollar vs ±10%",
+          "Capital matching $100,000"
+        ],
+        "rows": [
+          [
+            "0.01%",
+            "1",
+            "0.000100",
+            "2,222×",
+            "$45.00"
+          ],
+          [
+            "0.05%",
+            "10",
+            "0.001000",
+            "222×",
+            "$450.20"
+          ],
+          [
+            "0.30%",
+            "60",
+            "0.006018",
+            "36.9×",
+            "$2,707.98"
+          ],
+          [
+            "1.00%",
+            "200",
+            "0.020200",
+            "11.0×",
+            "$9,090.14"
+          ]
+        ],
+        "highlight": 4
+      }
+    }
+  ],
+  "roadmap": [
+    {
+      "tier": "0 (gate)",
+      "scope": "The reward model's in-range accounting",
+      "fixes": "Subtract post-`endTime` wall time from the credited in-range seconds (H-01 — one expression, no new state). Reject out-of-range positions at stake time and bound a stake's credited liquidity against the pool's own active liquidity (H-02). While either is open, an incentive funded through this contract can be stripped of its refund or denied its distribution for the price of gas.",
+      "closes": [
+        "H-01",
+        "H-02"
+      ],
+      "outcome": "The budget reaches the stakers it was meant for, and dust cannot suppress it"
+    },
+    {
+      "tier": "1",
+      "scope": "The permissionless eviction path",
+      "fixes": "Replace the spot `slot0.tick` test in `_isOutOfRange` with a condition a single block cannot manufacture — a TWAP tick from `pool.observe()`, or a minimum out-of-range dwell measured from two `secondsInside` snapshots. Consider removing the path outright once H-02 is fixed at source, since working around H-02 is the only reason it exists.",
+      "closes": [
+        "H-03"
+      ],
+      "outcome": "No caller can clear competing stakers out of an incentive with a swap"
+    },
+    {
+      "tier": "2",
+      "scope": "Token and arithmetic robustness",
+      "fixes": "Measure the reward-token balance before and after in `createIncentive` and credit what actually arrived (M-02). Route every `+` and `-` through `LowGasSafeMath`, starting with `incentive.totalReward + reward` and `incentive.stakedLiquidity += liquidity` (L-01).",
+      "closes": [
+        "M-02",
+        "L-01"
+      ],
+      "outcome": "Per-incentive accounting cannot drift from the contract's real balance"
+    },
+    {
+      "tier": "3",
+      "scope": "Distribution fairness and the untested surface",
+      "fixes": "Decide explicitly whether a minimum range width or a width-weighted reward is wanted (M-01) — a product decision, defensible either way, but it should be a stated one. Then address I-01 and build the test suite the project does not have: fork tests against a real V3 pool, plus Foundry invariant tests for `sum(payouts) + totalRewardUnclaimed == totalReward` and `every deposited NFT is withdrawable`. Run Slither, which this audit could not.",
+      "closes": [
+        "M-01",
+        "I-01"
+      ],
+      "outcome": "Distribution matches the stated intent, and regressions surface in CI rather than on-chain"
+    }
+  ],
+  "findings": [
+    {
+      "id": "H-01",
+      "title": "In-range seconds accrued after endTime are credited against a window that stops at endTime",
+      "severity": "High",
+      "status": "Fixed",
+      "location": "JunoswapV3Staker.sol:230-239 (and the same expression in getRewardInfo at :292-301); libraries/RewardMath.sol:38-53",
+      "description": "`unstakeToken` builds the payout as `accumulatorShare × secondsInside / stakedSeconds`. The two sides of that ratio measure different windows.\n\nThe **denominator** is capped at the incentive's end: `_accrue` returns `currentTime = min(block.timestamp, endTime)`, and `stakedSeconds` is derived from it. The **numerator** is not capped at all — `secondsInside` is read from `pool.snapshotCumulativesInside` at the moment of the call, and that counter keeps growing for as long as the position stays staked and the pool price sits inside its range, including every second after `endTime`.\n\nSo a stake accumulates in-range credit indefinitely after the incentive is over, against a denominator that stopped growing when the incentive ended. `RewardMath.computeRewardAmount` clamps the ratio at 1.0, which is what turns a slow leak into a full one: a position that was in range for *none* of the incentive can reach a ratio of exactly 1.0 and collect its entire accumulator share, simply by remaining staked until the pool price has spent `stakedSeconds` more seconds inside its range.\n\nNothing has to be manipulated for this to happen, but it can be. Once the incentive is over there is no cost to swapping the pool into one's own range and waiting — and the position holder chooses when to call `unstakeToken`, so they can wait for exactly the ratio they want.\n\nUpstream does not have this. Uniswap's `RewardMath` grows its denominator by `Math.max(endTime, currentTime) - startTime`, so a late unstaker's numerator and denominator inflate together and the reward converges rather than climbing. The fork dropped that term when it rewrote the model.\n\n**Verified numerically** against the project's own `test/reward-model.test.js` accounting class. An incentive of 1,000,000 over 1,000 seconds with one staker that is never in range during the incentive pays **0** if closed out at `endTime`, and the **full 1,000,000** if closed out 1,000 seconds later with the price inside its range for that period. The project's own case 7 covers the in-range-throughout variant of this scenario and passes; the out-of-range variant is untested.",
+      "impact": "A staked position collects reward for uptime it never had, taking it from `totalRewardUnclaimed` — that is, out of the refund `endIncentive` owes `key.refundee`. For a launchpad, the refundee is the launchpad itself, so this is real money, not an accounting curiosity.\n\nThe over-credit is `min(1, p + s/D) − p`, where `p` is the position's true in-range fraction during the incentive, `D` the incentive duration and `s` the in-range seconds it accrues after `endTime`. For a 30-day incentive: one day of post-end in-range time over-credits by 3% of the position's share, one week by 23%, and a full month takes any position to 100% of its share regardless of what it actually did.\n\nOther stakers are not directly diluted — the accumulator conserves, so each staker's share is fixed and the excess is taken only from the forfeited pool. The loss falls entirely on the refundee.\n\nThe mitigating factor is that `unstakeToken` becomes permissionless at `endTime`, so anyone — including the refundee — can close a stake out and freeze its ratio. That makes this a race rather than a guarantee, which is why it is High and not Critical. But it requires the refundee to be watching and to transact promptly for every outstanding stake, and `endIncentive` cannot even be called until all of them are closed.",
+      "recommendation": "Bound the credited in-range seconds by what could not possibly have accrued after the incentive ended. In-range seconds accrue at most one per wall-clock second, so at most `block.timestamp − endTime` of the observed growth is post-end; subtracting that yields a sound lower bound on the true pre-`endTime` in-range time, with no new storage and no new external call.\n\nThis errs against the late unstaker, which is the safe direction and reinforces the incentive to close stakes out promptly that the permissionless post-end unstake already creates. Apply the identical change to `getRewardInfo` so the view keeps matching the state-changing path.\n\nA fuller fix is to stop measuring in-range status after the fact at all and move it into the accumulator's denominator — see H-02, whose remediation subsumes this one.\n\n**Applied.** Both halves shipped together, because the clamp alone is not enough. `_measureUptime` discounts the reading by `block.timestamp - endTime`, which is a sound lower bound on the in-range time genuinely earned inside the reward window — but it loosens by one second per second of delay, so on its own it zeroes an honest staker who simply unstakes late. The project's own model test 7 (`unstaking long after endTime earns nothing extra`) catches exactly that regression, and it is a real one: under-crediting an honest LP is not an acceptable price for closing the leak.\n\n`finalizeStake` resolves it. Anyone may freeze a stake's in-range measurement from `endTime`, once, in a call cheap enough to batch every outstanding stake through `multicall`. Called in the block `endTime` passes, the discount is zero and the reading is exact, so honest stakes are paid in full however late they are unstaked. The two new `Stake` fields pack into the existing slot (232 of 256 bits), so this costs no extra storage.\n\nFreezing gives an attacker no lever in either direction: a position that was out of range during the incentive measures zero whenever it finalizes, and finalizing later only tightens the discount. Model case 12 asserts this across three freeze times.",
+      "code": " (, , uint32 secondsInside) = key.pool.snapshotCumulativesInside(deposit.tickLower, deposit.tickUpper);\n\n uint256 reward =\n     RewardMath.computeRewardAmount(\n         incentive.rewardPerLiquidityX128 - stake.rewardPerLiquidityInitialX128,\n         stake.liquidity,\n         currentTime > stake.stakeTime ? currentTime - stake.stakeTime : 0,\n-        // numerator keeps growing after endTime; the denominator above does not\n-        uint256(uint32(secondsInside - stake.secondsInsideInitial)),\n         incentive.totalRewardUnclaimed\n     );",
+      "fix": "+// Freezing the reading at endTime makes the discount below zero, so an honest stake is paid in\n+// full however late it is unstaked. Callable by anyone, once per stake, batchable via multicall.\n+function finalizeStake(IncentiveKey memory key, uint256 tokenId) external override {\n+    require(block.timestamp >= key.endTime, 'JunoswapV3Staker::finalizeStake: incentive not ended');\n+    Stake storage stored = stakes[tokenId][IncentiveId.compute(key)];\n+    require(stored.liquidity != 0 && !stored.finalized, 'JunoswapV3Staker::finalizeStake: nothing to freeze');\n+    stored.secondsInsideFinal = uint32(_measureUptime(key, deposits[tokenId], stored));\n+    stored.finalized = true;\n+}\n\n function _measureUptime(IncentiveKey memory key, Deposit memory deposit, Stake memory stake)\n     private view returns (uint256)\n {\n     (, , uint32 secondsInside) = key.pool.snapshotCumulativesInside(deposit.tickLower, deposit.tickUpper);\n     uint256 inside = uint256(uint32(secondsInside - stake.secondsInsideInitial));\n+    // at most (now - endTime) of that growth accrued after the incentive ended; drop it\n+    uint256 postEnd = block.timestamp > key.endTime ? block.timestamp - key.endTime : 0;\n+    return inside > postEnd ? inside - postEnd : 0;\n }",
+      "references": [
+        "https://github.com/Uniswap/v3-staker/blob/v1.0.2/contracts/libraries/RewardMath.sol",
+        "https://github.com/Uniswap/v3-core/blob/v1.0.0/contracts/UniswapV3Pool.sol"
+      ]
+    },
+    {
+      "id": "H-02",
+      "title": "Out-of-range staked liquidity dilutes every honest staker, and the forfeited share goes to the refundee instead of being redistributed",
+      "severity": "High",
+      "status": "Fixed",
+      "location": "JunoswapV3Staker.sol:341-360 (_stakeToken), :307-319 (_accrue); libraries/RewardMath.sol:19-27",
+      "description": "`_stakeToken` adds every position's liquidity to `incentive.stakedLiquidity` with no regard for whether the pool price is inside its range, and `_accrue` divides the drip by that total. The in-range correction is then applied at the *other* end, as a per-position multiplier on the payout.\n\nThe consequence is that an out-of-range position takes a full share out of the denominator while being paid nothing for it — and its share is not handed to the stakers who *were* in range. It stays in `totalRewardUnclaimed` and is paid to `key.refundee` by `endIncentive`.\n\nUpstream does not behave this way. Uniswap's `secondsPerLiquidityInsideX128` is normalised by the pool's *in-range* liquidity, so a position sitting outside the current price contributes nothing to anyone's denominator. The fork's rewrite moved the range test from the denominator to the payout and lost that property.\n\nThis is a real cost in ordinary operation — on any pool whose price moves, staked positions drift out of range and silently suppress everyone else's yield. It is also cheap to weaponise. Uniswap caps a single position's liquidity at `maxLiquidityPerTick = type(uint128).max / numTicks`, which is **1.1505e34** at the 0.3% fee tier, roughly thirteen orders of magnitude above a well-capitalised real position. A position that far out of range costs almost nothing to mint: `amount0 = L × (1/√a − 1/√b)` for a 60-tick-wide range at the top of the tick range comes to **1.879e12 wei — 0.0000019 tokens at 18 decimals**.\n\n**Verified numerically** with the project's own accounting model: a staker with `L = 1e21`, in range for the entire incentive, receives **0** of a 1,000,000 budget once one such position is staked alongside it. The entire budget is refunded to `key.refundee`.\n\nThe existing defence is the permissionless out-of-range unstake in `unstakeToken`, which lets anyone evict the dust position. It is a partial one: re-staking costs the attacker a single transaction, and staking `k` dust positions in one `multicall` forces `k` separate `unstakeToken` calls to clear. The eviction economics are asymmetric in the attacker's favour, and on a cheap-gas chain the war is affordable indefinitely. That defence is also itself a finding — see H-03.\n\n**Refuted during review:** the dilution cannot be applied retroactively. `_accrue` settles the accumulator using the pre-existing `stakedLiquidity` before the new stake is added, so a position staked and unstaked in the same block dilutes nothing. The attacker must hold the position continuously across the interval it wants to suppress.",
+      "impact": "In ordinary operation the fraction of the budget that reaches stakers equals the liquidity-weighted in-range uptime of the staked set — a single permanently-out-of-range peer of equal size halves an honest LP's yield, and the difference is returned to the refundee rather than redistributed. This defeats the contract's stated purpose, which is that a launchpad's fixed reward reaches its participants.\n\nUnder attack, an incentive can be denied its distribution almost entirely for the cost of gas plus dust: one `maxLiquidityPerTick` position drops an `L = 1e21` staker to 8.7e-14 of the budget. The attacker gains nothing directly — this is griefing — but the damage (an entire reward budget) is orders of magnitude above the cost, so it does not qualify for the Medium band where attacker cost is comparable to damage. LP principal is never at risk.",
+      "recommendation": "Two changes close the cheap attack with a small diff, and a third is the architectural fix.\n\n**1. Require a position to be in range to enter.** A one-line `require` in `_stakeToken` removes the entry point for a position that is out of range from the moment it is staked, which is the whole of the dust attack.\n\n**2. Bound the credited liquidity against the pool's own active liquidity.** `pool.liquidity()` is the in-range liquidity right now — a real, market-sized number. Requiring a stake not to exceed it makes a `maxLiquidityPerTick` position unstakeable unless the pool genuinely holds that much, which no pool does. Together with (1) this is the practical fix, and it is a smaller diff than reworking the accumulator.\n\n**3. Architecturally**, stop correcting for range after the fact and keep out-of-range liquidity out of the denominator, so the forfeited share is redistributed among the stakers who were in range rather than returned to the refundee. That requires the denominator to track tick crossings, which is what the pool's `secondsPerLiquidityInsideX128` already provides — reintroducing it for the numerator while keeping the fork's fixed drip is the shape worth designing toward. Whether the residue should go to in-range stakers or to the refundee is a product decision; the current code makes it implicitly, and it should be made explicitly.\n\nNeither (1) nor (2) handles a position that drifts out of range *after* it is staked, which is why (3) matters and why H-03 exists.",
+      "code": " require(pool == key.pool, 'JunoswapV3Staker::stakeToken: token pool is not the incentive pool');\n require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');\n-// nothing checks that the position is in range, or that its liquidity is of a sane size:\n-// a 0.0000019-token position at maxLiquidityPerTick (1.15e34) crushes every honest staker\n\n _accrue(incentive, key);\n\n deposits[tokenId].numberOfStakes++;\n incentive.numberOfStakes++;\n-incentive.stakedLiquidity += liquidity;",
+      "fix": " require(pool == key.pool, 'JunoswapV3Staker::stakeToken: token pool is not the incentive pool');\n require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');\n+// an out of range position earns nothing but occupies the accumulator's denominator, so it\n+// must not be allowed in to begin with\n+require(!_isOutOfRange(pool, tickLower, tickUpper), 'JunoswapV3Staker::stakeToken: position out of range');\n+// a far out of range position can be minted at maxLiquidityPerTick (1.15e34 at the 0.3% tier)\n+// for dust; the pool's own active liquidity is a market-sized ceiling that dust cannot reach\n+require(liquidity <= pool.liquidity(), 'JunoswapV3Staker::stakeToken: liquidity exceeds pool');\n\n _accrue(incentive, key);\n\n deposits[tokenId].numberOfStakes++;\n incentive.numberOfStakes++;\n+incentive.stakedLiquidity += liquidity;  // and see L-01: this addition is unchecked",
+      "references": [
+        "https://github.com/Uniswap/v3-core/blob/v1.0.0/contracts/libraries/Tick.sol",
+        "https://github.com/Uniswap/v3-staker/blob/v1.0.2/contracts/libraries/RewardMath.sol",
+        "https://uniswap.org/whitepaper-v3.pdf"
+      ]
+    },
+    {
+      "id": "H-03",
+      "title": "Permissionless out-of-range unstake is keyed on a spot tick, letting one swap evict every competing staker",
+      "severity": "High",
+      "status": "Fixed",
+      "location": "JunoswapV3Staker.sol:212-219 (unstakeToken), :321-328 (_isOutOfRange)",
+      "description": "The fork relaxes upstream's owner-only rule: any caller may close another owner's stake whenever `_isOutOfRange` is true. `_isOutOfRange` reads `slot0.tick` — the instantaneous pool price — with no TWAP, no observation window and no requirement that the position has been out of range for any length of time. A single swap in the same transaction sets that value.\n\nThe attack is one transaction from an attacker-owned contract: swap the pool past the ranges of every competing staker, call `unstakeToken` for each of them (permissionless now, because the tick says they are out of range), then swap back. Concentrated positions have narrow ranges by definition, so the displacement needed is small and most of it is recovered on the return swap; the net cost is two fee payments plus unrecovered slippage.\n\nThe victims' accrued reward up to that moment is credited, so nothing already earned is lost. What they lose is the future: they stop accruing, and only the deposit owner can call `stakeToken` to get back in, so each victim must notice and pay to re-enter. Between the eviction and their return the attacker's own position is a larger fraction of `stakedLiquidity` and takes a correspondingly larger fraction of the drip.\n\nOne asymmetry makes it worse: `_isOutOfRange` can never be true for a full-range position, since `tick < MIN_TICK` is unreachable. An attacker staked at `[MIN_TICK, MAX_TICK]` is structurally immune to the mechanism it is using on everyone else, and stays in range through its own manipulation.\n\nThe same transaction is available as pure griefing with no position at all, at the cost of the swap round trip alone.\n\nThis path exists to work around H-02 — an out-of-range position that keeps diluting everyone else. That is a real problem, but a spot-tick test is not a safe way to detect it.",
+      "impact": "The reward drip is transferred from narrow-range LPs to the attacker for the duration of each eviction gap, and the attack is repeatable every block. Yield only — the deposit and the NFT are never at risk, and already-accrued reward is credited before the stake is closed.\n\nSecondary effect: a victim who is evicted and does not notice earns nothing for the rest of the incentive while believing they are staked, and the reward they would have earned is forfeited to `key.refundee` under H-02 rather than redistributed.",
+      "recommendation": "Gate the eviction on a condition a single block cannot manufacture.\n\n**Preferred:** require a minimum out-of-range dwell time rather than an instantaneous reading. The pool already provides the measurement — compare two `snapshotCumulativesInside` observations and require that `secondsInside` has not advanced over a window of, say, an hour. This tests the thing that actually matters (the position has genuinely stopped earning) instead of a proxy that is manipulable within one transaction.\n\n**Alternative:** read a TWAP tick from `pool.observe()` over a fixed window instead of `slot0.tick`. Cheaper to implement, but it needs the pool's observation cardinality to be large enough for the window, which is not guaranteed and should be checked at incentive creation.\n\n**Also:** consider removing the eviction path entirely once H-02 is fixed at source. Its only purpose is to limit the damage from out-of-range dilution; if out-of-range liquidity no longer dilutes, the path is a liability with no remaining benefit.\n\n**Applied**, via the dwell-time option rather than the TWAP one. The eviction test is now `stakedSeconds >= 1 hours && secondsInside * 10 <= stakedSeconds` — the stake has existed long enough to judge, and has spent at most a tenth of that time in range. Both quantities are already computed for the payout, so this adds no external call, and unlike the TWAP option it carries no dependency on the pool's observation cardinality (where an insufficient window would make `observe` revert and disable eviction entirely).\n\nIt measures the harm directly rather than a proxy for it, and it cannot be manufactured in one transaction: a swap changes the current tick, but it cannot retroactively remove in-range seconds a position has already banked. A position that is genuinely earning is no longer evictable at all; one that has earned essentially nothing over an hour still is, which is what the path exists for.",
+      "code": " if (deposit.owner != msg.sender) {\n     // anyone may unstake once the incentive is over, or while the position is out of range\n     require(\n-        block.timestamp >= key.endTime || _isOutOfRange(key.pool, deposit.tickLower, deposit.tickUpper),\n         'JunoswapV3Staker::unstakeToken: only owner can unstake an in-range token before incentive end time'\n     );\n }\n\n function _isOutOfRange(IUniswapV3Pool pool, int24 tickLower, int24 tickUpper) private view returns (bool) {\n-    // slot0.tick is the spot price: one swap in this same transaction sets it\n-    (, int24 tick, , , , , ) = pool.slot0();\n     return tick < tickLower || tick >= tickUpper;\n }",
+      "fix": " if (deposit.owner != msg.sender) {\n     require(\n         block.timestamp >= key.endTime ||\n+            // staked long enough to judge, and almost none of it spent in range: it earns\n+            // nothing while still diluting everyone else. Both terms are measured over the\n+            // whole life of the stake, so moving the price now cannot un-earn seconds already\n+            // accrued -- there is no single-transaction version of this condition.\n+            (stakedSeconds >= MIN_EVICTION_STAKE_AGE &&\n+                secondsInsideStaked * EVICTION_UPTIME_DIVISOR <= stakedSeconds),\n         'JunoswapV3Staker::unstakeToken: only owner can unstake an earning token before incentive end time'\n     );\n }",
+      "references": [
+        "https://github.com/Uniswap/v3-staker/blob/v1.0.2/contracts/UniswapV3Staker.sol",
+        "https://github.com/Uniswap/v3-core/blob/v1.0.0/contracts/libraries/Oracle.sol",
+        "https://swcregistry.io/docs/SWC-114"
+      ]
+    },
+    {
+      "id": "M-01",
+      "title": "Reward weight is raw liquidity with no range-width floor, so $45 at the minimum width matches $100,000 at ±10%",
+      "severity": "Medium",
+      "status": "Open",
+      "location": "JunoswapV3Staker.sol:341-360 (_stakeToken); libraries/RewardMath.sol:19-27",
+      "description": "A position's share of the drip is its `liquidity` divided by `stakedLiquidity`, with no reference to how wide its range is. In Uniswap V3, liquidity per unit of deposited capital scales as the inverse of range width: for a position around price `P` spanning relative width `W`, the value deposited is roughly `L × √P × W / 2`, so `L = 2V / (√P × W)`. Reward per dollar therefore scales as `1 / W`, without limit down to the tick spacing.\n\nThe practical effect is that whoever posts the tightest range collects the budget. At the 0.01% fee tier, where tick spacing is 1 and the minimum width is 0.0001, a **$45** position earns what a **$100,000** position at ±10% earns. At the 0.30% tier the ratio is 36.9×, and even at 1.00% it is 11×.\n\nThe trade-off the LP accepts is that a minimum-width position falls out of range on almost any price movement, and under this contract that means both losing its own uptime multiplier and (under H-03) becoming evictable. But it can simply be re-minted around the new price, and while it is in range it dominates.\n\n**This is inherited from upstream, not introduced by the fork** — Uniswap's own staker also weights by raw liquidity, and this is a known property of V3 liquidity mining generally. It is reported because the fork's stated design goal is that a launchpad's fixed reward reaches its participants, and this determines who those participants turn out to be.",
+      "impact": "The reward budget concentrates on whoever posts the tightest range with the most capital, rather than on the LPs providing usable depth. A launchpad believing it is rewarding its liquidity providers is in practice running an auction for the narrowest position. There is no theft and no loss of principal — the effect is on who receives the distribution, and the magnitude is set by the fee tier: 2,222× at 0.01%, 36.9× at 0.30%.\n\nFiled at Medium: the value leak is real and bounded by the budget, and no exploit or privilege is needed, but it is a distribution-fairness property rather than a defect, and it is inherited rather than introduced.",
+      "recommendation": "This is a product decision and either answer is defensible, but it should be an explicit one rather than a consequence of the weighting formula.\n\n**Option A — minimum width.** Require `tickUpper - tickLower >= MIN_WIDTH_TICKS` at stake time, with the floor set from the pool's fee tier and expected volatility, and stored as an `immutable` or per-incentive constructor parameter. Simplest to implement and easy for LPs to reason about.\n\n**Option B — width-weighted reward.** Credit `liquidity × (tickUpper − tickLower)` instead of `liquidity` alone, which makes reward proportional to deposited value rather than to concentration. This changes the accumulator's units but not its structure, and it removes the incentive to narrow rather than merely capping it.\n\n**Option C — document it.** If concentration is the intent, say so in the incentive's public documentation, because the current NatSpec implies the opposite.\n\nWhichever is chosen, state the resulting distribution alongside the incentive so participants can price their position before committing capital.\n\n**Not applied** — deliberately. This is a product decision about who the incentive is meant to reward, not a defect, and either answer is defensible. Picking a `minRangeTicks` on the team's behalf would bake in a judgement about the pool's expected volatility that this review has no basis for making.",
+      "code": " require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');\n-// no floor on (tickUpper - tickLower): a minimum-width position earns 2,222x per dollar at\n-// the 0.01% tier, so $45 collects what $100,000 at +/-10% collects\n\n incentive.stakedLiquidity += liquidity;",
+      "fix": " require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');\n+// Option A: a width floor, so reward per dollar cannot be driven up without limit by narrowing.\n+// Set minRangeTicks from the pool's fee tier and expected volatility at deployment.\n+require(\n+    uint256(int256(tickUpper) - int256(tickLower)) >= minRangeTicks,\n+    'JunoswapV3Staker::stakeToken: range too narrow'\n+);\n\n incentive.stakedLiquidity += liquidity;",
+      "references": [
+        "https://uniswap.org/whitepaper-v3.pdf",
+        "https://github.com/Uniswap/v3-staker/blob/v1.0.2/contracts/UniswapV3Staker.sol"
+      ]
+    },
+    {
+      "id": "M-02",
+      "title": "Per-incentive accounting assumes an exact-transfer ERC-20; a fee-on-transfer or rebasing reward token freezes claims across every incentive sharing it",
+      "severity": "Medium",
+      "status": "Fixed",
+      "location": "JunoswapV3Staker.sol:112-115 (createIncentive), :250-264 (claimReward)",
+      "description": "`createIncentive` credits `incentive.totalReward` and `incentive.totalRewardUnclaimed` with the *requested* `reward` and only then calls `safeTransferFrom`. It never checks how much actually arrived.\n\nIncentive accounting is per-incentive, but the token balance backing it is global. `rewards[rewardToken][owner]` and the contract's balance of that token are shared by every incentive using the same reward token, so a shortfall in one is paid out of another's funds until the balance runs out — at which point `claimReward` reverts for whoever is left, with no way to recover.\n\nThree token behaviours produce the shortfall:\n\n- **Fee-on-transfer / deflationary.** The contract receives `reward × (1 − fee)` while the books say `reward`. Because incentive creation is permissionless, this can be done deliberately: an attacker creates a second incentive on the same token, stakes their own position as sole staker, and unstakes at `endTime` with `rewards[token][attacker]` set to the full nominal figure — the difference comes out of the honest incentive's balance.\n- **Rebasing tokens** that contract, for the same reason, without anyone acting.\n- **Blocklisting tokens** (USDC-style), where a blocklisted recipient makes `claimReward` revert permanently for that address. Also **tokens with admin balance controls**, including KAP-20's `adminTransfer` on KUB Chain, which lets the token developer move the reward balance out from under this contract entirely.\n\nThe attack is confined to reward tokens that are themselves non-standard — a clean ERC-20's incentive cannot be drained this way, because a shortfall can only be created in the token's own denomination. That confinement is what holds this at Medium.",
+      "impact": "Rewards owed to stakers of one incentive are paid out of another incentive's funds, and the last claimants find `claimReward` reverting permanently — a freeze of already-earned rewards with no admin recovery path, because this contract deliberately has no admin. LP principal is unaffected: the NFT withdrawal path does not touch the reward token at all, which is the single most important reason this is not High.\n\nA deliberate version requires the honest incentive to already be denominated in a fee-on-transfer token, in which case it was broken before the attacker arrived. The realistic exposure is an incentive creator picking a token without knowing its transfer semantics.",
+      "recommendation": "Credit what actually arrived rather than what was asked for. Measure the contract's balance before and after the transfer and use the difference — three extra lines, no behavioural change for a well-behaved token, and it makes the per-incentive books match the real balance by construction.\n\nThis does not fix blocklists or admin-controlled balances, which cannot be fixed from this side. For those, document the constraint clearly for incentive creators: the reward token must be a standard ERC-20 with no transfer fee, no rebasing, no blocklist and no privileged balance movement. On KUB Chain in particular, audit the KAP-20 committee address of any token used as a reward, per `kub.md`.\n\nAlso consider rejecting a reward token whose `balanceOf` does not increase at all, which catches the pathological cases early rather than at the first claim.",
+      "code": " uint256 totalReward = incentive.totalReward + reward;\n require(totalReward <= type(uint128).max, 'JunoswapV3Staker::createIncentive: reward too large');\n\n-// the books are credited with what was asked for, not with what arrived\n-incentive.totalReward = totalReward;\n-incentive.totalRewardUnclaimed += reward;\n-\n-TransferHelperExtended.safeTransferFrom(address(key.rewardToken), msg.sender, address(this), reward);",
+      "fix": "+// credit what actually arrived: a fee-on-transfer or rebasing token would otherwise leave the\n+// per-incentive books above the shared balance, and the shortfall is paid out of another\n+// incentive using the same reward token until claimReward reverts for whoever is left\n+uint256 balanceBefore = key.rewardToken.balanceOf(address(this));\n+TransferHelperExtended.safeTransferFrom(address(key.rewardToken), msg.sender, address(this), reward);\n+uint256 received = key.rewardToken.balanceOf(address(this)) - balanceBefore;\n+require(received > 0, 'JunoswapV3Staker::createIncentive: no reward received');\n+\n+uint256 totalReward = incentive.totalReward + received;\n+require(totalReward <= type(uint128).max, 'JunoswapV3Staker::createIncentive: reward too large');\n+\n+incentive.totalReward = totalReward;\n+incentive.totalRewardUnclaimed += received;",
+      "references": [
+        "https://github.com/d-xo/weird-erc20",
+        "https://docs.kubchain.com/quickstart/launching-a-token-on-kub/kap-token-interfaces"
+      ]
+    },
+    {
+      "id": "L-01",
+      "title": "Unchecked arithmetic in solc 0.7.6 — the uint128 reward cap can be wrapped past, and stakedLiquidity accumulates unchecked",
+      "severity": "Low",
+      "status": "Fixed",
+      "location": "JunoswapV3Staker.sol:108-113 (createIncentive), :351 (_stakeToken), :228 (unstakeToken)",
+      "description": "The contract is pinned to solc 0.7.6, where arithmetic wraps silently rather than reverting, and it imports no `SafeMath`. Upstream is the same, but two of the additions the fork makes are affected.\n\n**The reward cap defeats itself.** `uint256 totalReward = incentive.totalReward + reward;` is unchecked, so a `reward` close to `type(uint256).max` wraps the sum to a small value that passes `require(totalReward <= type(uint128).max)` — the very guard whose comment says it keeps the accumulator clear of overflow — while `incentive.totalRewardUnclaimed += reward` records the enormous figure. This requires a token whose supply approaches 2^256, so it is not reachable against any real token, and an attacker-authored token only affects its own incentive. But the check the fork added does not hold under its own arithmetic.\n\n**`stakedLiquidity` accumulates unchecked.** `incentive.stakedLiquidity += liquidity` at line 351 is a `uint128` sum over an unbounded number of positions. Uniswap caps a single position at `maxLiquidityPerTick`, so the sum wraps only after roughly `numTicks` maximum-liquidity positions — **8,874** at the 1% fee tier, 29,576 at 0.3%, 177,456 at 0.05%. Each such position costs dust to mint (see H-02) but a full stake transaction to add, so the gas is the real barrier: several billion gas at the 1% tier. Affordable on a cheap-gas chain, laborious anywhere. Once wrapped, the matching `-=` at line 228 underflows on unstake and the accumulator denominator becomes meaningless; rewards are lost, though the NFTs still come out and no function bricks.\n\nNote that the two `uint32(secondsInside - initial)` casts are *not* part of this finding — that is intentional modular arithmetic on a Uniswap accumulator designed to wrap, and it is correct as written in 0.7.6.",
+      "impact": "Neither path is reachable against a standard reward token in a normally-sized incentive, and neither can freeze funds or trap an LP NFT. The reward-cap wrap harms only the incentive created with the pathological token. The `stakedLiquidity` wrap corrupts reward accounting for one incentive at a cost of billions of gas, with no gain to the attacker beyond the griefing already available far more cheaply through H-02.\n\nReported because the guard the fork introduced does not do what its comment claims, and because that comment is load-bearing for the accumulator-overflow argument in liveness check 6.",
+      "recommendation": "Use `LowGasSafeMath` — already a dependency via `@uniswap/v3-core` — for both additions, so a wrap reverts instead of passing the guard. For `stakedLiquidity`, add the sum in `uint256` and downcast through an explicit bound check, since `LowGasSafeMath` does not cover `uint128`.\n\nIf the contract is ever ported to solc 0.8, the two `uint32(secondsInside - stake.secondsInsideInitial)` expressions **must** be wrapped in `unchecked` blocks. They are designed to wrap, and 0.8's checked arithmetic would turn them into a permanent revert on `unstakeToken` — converting a deliberate no-op into a bricked withdrawal path. Note this in the code before anyone attempts the upgrade.",
+      "code": " uint256 totalReward = incentive.totalReward + reward;\n-// 0.7.6 does not check this addition, so a reward near type(uint256).max wraps the sum to a\n-// small value and passes the very guard meant to bound the accumulator\n require(totalReward <= type(uint128).max, 'JunoswapV3Staker::createIncentive: reward too large');\n\n ...\n\n-incentive.stakedLiquidity += liquidity;  // unchecked uint128 sum over unbounded positions",
+      "fix": "+using LowGasSafeMath for uint256;\n\n+uint256 totalReward = incentive.totalReward.add(reward);\n require(totalReward <= type(uint128).max, 'JunoswapV3Staker::createIncentive: reward too large');\n\n ...\n\n+uint256 newStaked = uint256(incentive.stakedLiquidity) + liquidity;\n+require(newStaked <= type(uint128).max, 'JunoswapV3Staker::stakeToken: staked liquidity overflow');\n+incentive.stakedLiquidity = uint128(newStaked);",
+      "references": [
+        "https://github.com/Uniswap/v3-core/blob/v1.0.0/contracts/libraries/LowGasSafeMath.sol",
+        "https://docs.soliditylang.org/en/v0.8.0/080-breaking-changes.html"
+      ]
+    },
+    {
+      "id": "I-01",
+      "title": "Informational — timestamp horizon, trapped ETH, misleading reverts, and the missing test surface",
+      "severity": "Informational",
+      "status": "Open",
+      "location": "JunoswapV3Staker.sol:103, :121-133, :250-264, :158-167; hardhat.config.js; test/",
+      "description": "Seven items with no security impact individually. None needs to block a deployment; all are cheap to close.\n\n**1. Incentives cannot end after 2106.** `require(key.endTime <= type(uint32).max)` at line 103 caps `endTime` at 2106-02-07, so `stakeTime` and `secondsInsideInitial` fit in `uint32`. Correct and deliberate, but the horizon is not documented in the NatSpec and `createIncentive` will begin rejecting long-dated incentives well before that date. State the limit in the interface.\n\n**2. `multicall` is payable but nothing is.** `Multicall.multicall` from v3-periphery is `payable`, while this contract has no payable function and no withdrawal path for ETH. Any ETH sent alongside a multicall is permanently trapped. Inherited from upstream; worth an explicit `require(msg.value == 0)` override, or a note for integrators.\n\n**3. `endIncentive` reverts confusingly when everything was distributed.** `require(refund > 0)` is checked *before* `require(numberOfStakes == 0)`, so an incentive that distributed its whole budget reverts with 'no refund available' and never emits `IncentiveEnded`. Harmless — there is nothing to refund — but indexers relying on the event will never see the incentive close. Consider emitting the event and returning zero instead of reverting.\n\n**4. `claimReward(token, to, 0)` claims everything.** `amountRequested == 0` is the 'claim all' sentinel. Inherited from upstream and documented nowhere in this interface; an integrator passing a computed zero amount will move the entire balance. Document it or use `type(uint256).max` as the sentinel instead.\n\n**5. `onERC721Received`'s `data.length == 160` heuristic is fragile.** It distinguishes a single `IncentiveKey` from an array by encoded length. Correct today because `IncentiveKey` is five static fields, but it breaks silently if a field is ever added or made dynamic. Inherited from upstream. Add a comment tying the constant to the struct's field count.\n\n**6. The `keys` loop in `onERC721Received` has no explicit cap.** Self-limiting — an over-long array only exhausts the caller's own gas — so not a DoS. Noted for completeness because it is the only loop in the contract.\n\n**7. There are no on-chain tests.** `test/reward-model.test.js` is a JavaScript re-implementation of the accounting and it passes, but nothing exercises the compiled bytecode against a real Uniswap V3 pool. `snapshotCumulativesInside` — the external call every reward calculation depends on, and the one at the centre of H-01 — is never invoked in any test. `hardhat.config.js` declares no networks and there is no deployment script.",
+      "impact": "None individually. Item 7 is the one that matters in aggregate: the reward model is new code with no test coverage against the primitive it is built on, which is why H-01 was reachable — the project's own model tests the case where a position is in range throughout (case 7) but not the case where it is in range only after `endTime`.",
+      "recommendation": "Items 1, 4 and 5: document in the NatSpec of `IJunoswapV3Staker`. Item 2: override `multicall` with `require(msg.value == 0)`. Item 3: emit `IncentiveEnded` with a zero refund rather than reverting.\n\nItem 7 is the substantive one. Build three layers:\n\n- **Fork tests** against a real V3 pool — mint positions, move the price with real swaps, stake, let time pass, unstake, and assert the payouts. This is the layer that would have caught H-01 and H-02.\n- **Foundry invariant tests** on the two properties this contract must never violate: `sum(all payouts) + totalRewardUnclaimed == totalReward` for every incentive, and `every deposited NFT is withdrawable` — the latter matters more than usual here, because liveness check 7 notes there is no emergency exit behind the reward math.\n- **Slither in CI**, which this audit could not run.\n\nAdd `forge test --gas-report` or `forge snapshot` at the same time so the gas cost of any fix to H-01/H-02 is visible.",
+      "references": [
+        "https://github.com/foundry-rs/foundry",
+        "https://github.com/crytic/slither",
+        "https://github.com/Uniswap/v3-periphery/blob/v1.0.1/contracts/base/Multicall.sol"
+      ]
+    }
+  ]
+}

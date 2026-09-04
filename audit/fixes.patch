@@ -1,0 +1,249 @@
+--- JunoswapV3Staker.orig.sol	2026-09-04 19:58:15.455493900 +0700
++++ C:/Users/supis/Documents/GitHub/v3staker/juno/contracts/JunoswapV3Staker.sol	2026-09-04 19:34:37.817103500 +0700
+@@ -11,17 +11,27 @@
+ import '@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol';
+ import '@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol';
+ import '@uniswap/v3-core/contracts/interfaces/IERC20Minimal.sol';
++import '@uniswap/v3-core/contracts/libraries/LowGasSafeMath.sol';
+ 
+ import '@uniswap/v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol';
+ import '@uniswap/v3-periphery/contracts/base/Multicall.sol';
+ 
+ /// @title Juno V3 staking
+ /// Uniswap measures a position against the liquidity-seconds of the *entire pool*, so an incentive
+ /// on a pool where only a slice of the TVL is staked pays out only that slice of the budget. Here
+ /// the budget drips at totalReward / duration and every second is split between the positions
+ /// actually staked in the incentive, so a launchpad's fixed reward reaches its participants.
+ contract JunoswapV3Staker is IJunoswapV3Staker, Multicall {
++    using LowGasSafeMath for uint256;
++
++    /// @dev How long a stake must have existed before anyone but its owner may close it out for
++    /// having earned nothing. Long enough that no single transaction can manufacture the condition.
++    uint256 private constant MIN_EVICTION_STAKE_AGE = 1 hours;
++
++    /// @dev A stake is evictable once its in-range time is at most this fraction of its staked life.
++    uint256 private constant EVICTION_UPTIME_DIVISOR = 10;
++
+     /// @notice Represents a staking incentive
+     struct Incentive {
+         uint256 totalReward;
+@@ -41,11 +51,15 @@
+     }
+ 
+     /// @notice Represents a staked liquidity NFT
++    /// @dev The last two fields pack into the same slot as the three before them (232 of 256 bits),
++    /// so freezing a stake's uptime costs no extra storage slot.
+     struct Stake {
+         uint256 rewardPerLiquidityInitialX128;
+         uint32 secondsInsideInitial;
+         uint32 stakeTime;
+         uint128 liquidity;
++        uint32 secondsInsideFinal;
++        bool finalized;
+     }
+ 
+     /// @inheritdoc IJunoswapV3Staker
+@@ -105,16 +119,24 @@
+         bytes32 incentiveId = IncentiveId.compute(key);
+         Incentive storage incentive = incentives[incentiveId];
+ 
+-        uint256 totalReward = incentive.totalReward + reward;
++        // credit what actually arrived, not what was asked for: a fee-on-transfer or rebasing token
++        // would otherwise leave this incentive's books above the shared balance, and the shortfall
++        // is paid out of any other incentive using the same reward token until claiming reverts
++        uint256 balanceBefore = key.rewardToken.balanceOf(address(this));
++        TransferHelperExtended.safeTransferFrom(address(key.rewardToken), msg.sender, address(this), reward);
++        uint256 received = key.rewardToken.balanceOf(address(this)).sub(balanceBefore);
++        require(received > 0, 'JunoswapV3Staker::createIncentive: no reward received');
++
++        // .add, not +: this contract is on 0.7.6, where a plain addition wraps silently and would
++        // slip a huge reward past the cap below
++        uint256 totalReward = incentive.totalReward.add(received);
+         // keeps the X128 accumulator math well clear of overflow, even for a single wei of liquidity
+         require(totalReward <= type(uint128).max, 'JunoswapV3Staker::createIncentive: reward too large');
+ 
+         incentive.totalReward = totalReward;
+-        incentive.totalRewardUnclaimed += reward;
+-
+-        TransferHelperExtended.safeTransferFrom(address(key.rewardToken), msg.sender, address(this), reward);
++        incentive.totalRewardUnclaimed = incentive.totalRewardUnclaimed.add(received);
+ 
+-        emit IncentiveCreated(key.rewardToken, key.pool, key.startTime, key.endTime, key.refundee, reward);
++        emit IncentiveCreated(key.rewardToken, key.pool, key.startTime, key.endTime, key.refundee, received);
+     }
+ 
+     /// @inheritdoc IJunoswapV3Staker
+@@ -209,32 +231,37 @@
+ 
+         require(stake.liquidity != 0, 'JunoswapV3Staker::unstakeToken: stake does not exist');
+ 
+-        if (deposit.owner != msg.sender) {
+-            // anyone may unstake once the incentive is over, or while the position is out of range:
+-            // an out of range position earns nothing, but staying staked it keeps diluting everyone else
+-            require(
+-                block.timestamp >= key.endTime || _isOutOfRange(key.pool, deposit.tickLower, deposit.tickUpper),
+-                'JunoswapV3Staker::unstakeToken: only owner can unstake an in-range token before incentive end time'
+-            );
+-        }
+-
+         Incentive storage incentive = incentives[incentiveId];
+ 
+         // bring the accumulator up to date while this position is still counted in stakedLiquidity
+         uint256 currentTime = _accrue(incentive, key);
+ 
++        (uint256 stakedSeconds, uint256 secondsInsideStaked) = _stakeUptime(key, deposit, stake, currentTime);
++
++        if (deposit.owner != msg.sender) {
++            // anyone may unstake once the incentive is over, or close out a stake that has existed
++            // long enough to judge and spent almost none of that time in range: it earns nothing
++            // while still diluting everyone else. Both terms are measured over the whole life of
++            // the stake, so no single swap can manufacture the condition the way a spot tick check
++            // could -- moving the price now cannot un-earn seconds already accrued.
++            require(
++                block.timestamp >= key.endTime ||
++                    (stakedSeconds >= MIN_EVICTION_STAKE_AGE &&
++                        secondsInsideStaked * EVICTION_UPTIME_DIVISOR <= stakedSeconds),
++                'JunoswapV3Staker::unstakeToken: only owner can unstake an earning token before incentive end time'
++            );
++        }
++
+         deposits[tokenId].numberOfStakes--;
+         incentive.numberOfStakes--;
+         incentive.stakedLiquidity -= stake.liquidity;
+ 
+-        (, , uint32 secondsInside) = key.pool.snapshotCumulativesInside(deposit.tickLower, deposit.tickUpper);
+-
+         uint256 reward =
+             RewardMath.computeRewardAmount(
+                 incentive.rewardPerLiquidityX128 - stake.rewardPerLiquidityInitialX128,
+                 stake.liquidity,
+-                currentTime > stake.stakeTime ? currentTime - stake.stakeTime : 0,
+-                uint256(uint32(secondsInside - stake.secondsInsideInitial)),
++                stakedSeconds,
++                secondsInsideStaked,
+                 incentive.totalRewardUnclaimed
+             );
+ 
+@@ -247,6 +274,24 @@
+     }
+ 
+     /// @inheritdoc IJunoswapV3Staker
++    function finalizeStake(IncentiveKey memory key, uint256 tokenId) external override {
++        require(block.timestamp >= key.endTime, 'JunoswapV3Staker::finalizeStake: incentive not ended');
++
++        bytes32 incentiveId = IncentiveId.compute(key);
++        Stake storage stored = stakes[tokenId][incentiveId];
++        require(stored.liquidity != 0, 'JunoswapV3Staker::finalizeStake: stake does not exist');
++        require(!stored.finalized, 'JunoswapV3Staker::finalizeStake: already finalized');
++
++        // store the clamped delta, not the raw counter: called in the block endTime passes, the
++        // clamp is zero and the reading is exact
++        uint256 inside = _measureUptime(key, deposits[tokenId], stored);
++        stored.secondsInsideFinal = uint32(inside);
++        stored.finalized = true;
++
++        emit StakeFinalized(tokenId, incentiveId, inside);
++    }
++
++    /// @inheritdoc IJunoswapV3Staker
+     function claimReward(
+         IERC20Minimal rewardToken,
+         address to,
+@@ -289,18 +334,59 @@
+             );
+         }
+ 
+-        (, , uint32 secondsInside) = key.pool.snapshotCumulativesInside(deposit.tickLower, deposit.tickUpper);
+-        secondsInsideStaked = uint256(uint32(secondsInside - stake.secondsInsideInitial));
++        uint256 stakedSeconds;
++        (stakedSeconds, secondsInsideStaked) = _stakeUptime(key, deposit, stake, currentTime);
+ 
+         reward = RewardMath.computeRewardAmount(
+             incentive.rewardPerLiquidityX128 - stake.rewardPerLiquidityInitialX128,
+             stake.liquidity,
+-            currentTime > stake.stakeTime ? currentTime - stake.stakeTime : 0,
++            stakedSeconds,
+             secondsInsideStaked,
+             incentive.totalRewardUnclaimed
+         );
+     }
+ 
++    /// @dev The seconds a stake has been open (capped at endTime) and, of those, the seconds the
++    /// pool price was inside its range.
++    function _stakeUptime(
++        IncentiveKey memory key,
++        Deposit memory deposit,
++        Stake memory stake,
++        uint256 currentTime
++    ) private view returns (uint256 stakedSeconds, uint256 secondsInsideStaked) {
++        stakedSeconds = currentTime > stake.stakeTime ? currentTime - stake.stakeTime : 0;
++        secondsInsideStaked = stake.finalized
++            ? uint256(stake.secondsInsideFinal)
++            : _measureUptime(key, deposit, stake);
++    }
++
++    /// @dev In-range seconds earned since the token was staked, with any that could have accrued
++    /// after endTime removed.
++    /// @dev The pool's secondsInside counter keeps growing after endTime while stakedSeconds stops
++    /// there, so an unclamped ratio would let a position that was never in range during the
++    /// incentive reach a full payout just by staying staked until the price sat in its range for
++    /// long enough afterwards. At most (block.timestamp - endTime) of the observed growth can have
++    /// happened after the incentive ended, so subtracting that much lower-bounds the in-range time
++    /// genuinely earned inside the reward window. The bound is exact when read at or before endTime
++    /// and loosens by one second per second of delay, which is why finalizeStake exists: freezing
++    /// the reading at endTime makes the subtraction zero and pays every honest stake in full, no
++    /// matter how late it is unstaked.
++    function _measureUptime(
++        IncentiveKey memory key,
++        Deposit memory deposit,
++        Stake memory stake
++    ) private view returns (uint256) {
++        (, , uint32 secondsInside) = key.pool.snapshotCumulativesInside(deposit.tickLower, deposit.tickUpper);
++
++        // NOTE: this subtraction is deliberate modular arithmetic on a Uniswap accumulator built to
++        // wrap, and is correct on 0.7.6. If this contract is ever ported to 0.8, it MUST be wrapped
++        // in an `unchecked` block or unstakeToken will revert permanently once the counter wraps.
++        uint256 inside = uint256(uint32(secondsInside - stake.secondsInsideInitial));
++
++        uint256 postEnd = block.timestamp > key.endTime ? block.timestamp - key.endTime : 0;
++        return inside > postEnd ? inside - postEnd : 0;
++    }
++
+     /// @dev Brings the reward accumulator up to date and returns the time it is accurate as of
+     /// (block.timestamp, capped at endTime). Seconds during which nothing was staked accrue nothing,
+     /// so that reward is left for the refundee rather than handed to whoever stakes next.
+@@ -343,12 +429,22 @@
+ 
+         require(pool == key.pool, 'JunoswapV3Staker::stakeToken: token pool is not the incentive pool');
+         require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');
++        // an out of range position earns nothing but still occupies the accumulator's denominator,
++        // diluting everyone who is earning, so it must not be let in to begin with
++        require(!_isOutOfRange(pool, tickLower, tickUpper), 'JunoswapV3Staker::stakeToken: position out of range');
++        // liquidity per unit of capital is unbounded as a range narrows, so a position far out of
++        // range can be minted at maxLiquidityPerTick (1.15e34 at the 0.3% tier) for dust and crush
++        // every real staker. The pool's own active liquidity is a market-sized ceiling dust cannot reach.
++        require(liquidity <= pool.liquidity(), 'JunoswapV3Staker::stakeToken: liquidity exceeds pool');
+ 
+         _accrue(incentive, key);
+ 
+         deposits[tokenId].numberOfStakes++;
+         incentive.numberOfStakes++;
+-        incentive.stakedLiquidity += liquidity;
++        // .add + explicit bound, not +=: 0.7.6 does not check this uint128 accumulation
++        uint256 newStakedLiquidity = uint256(incentive.stakedLiquidity).add(liquidity);
++        require(newStakedLiquidity <= type(uint128).max, 'JunoswapV3Staker::stakeToken: staked liquidity overflow');
++        incentive.stakedLiquidity = uint128(newStakedLiquidity);
+ 
+         (, , uint32 secondsInside) = pool.snapshotCumulativesInside(tickLower, tickUpper);
+ 
+@@ -356,7 +452,9 @@
+             rewardPerLiquidityInitialX128: incentive.rewardPerLiquidityX128,
+             secondsInsideInitial: secondsInside,
+             stakeTime: uint32(block.timestamp),
+-            liquidity: liquidity
++            liquidity: liquidity,
++            secondsInsideFinal: 0,
++            finalized: false
+         });
+ 
+         emit TokenStaked(tokenId, incentiveId, liquidity);
