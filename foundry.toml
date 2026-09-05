@@ -1,0 +1,19 @@
+[profile.default]
+src = 'contracts'
+out = 'out'
+libs = ['node_modules']
+test = 'test'
+solc = '0.7.6'
+optimizer = true
+optimizer_runs = 1000000
+bytecode_hash = 'none'
+evm_version = 'istanbul' # no PUSH0: KUB nodes may predate Shanghai
+remappings = [
+    '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/',
+    '@uniswap/v3-core/=node_modules/@uniswap/v3-core/',
+    '@uniswap/v3-periphery/=node_modules/@uniswap/v3-periphery/',
+]
+
+[rpc_endpoints]
+kub_testnet = "${KUB_TESTNET_RPC}"
+kub_mainnet = "${KUB_MAINNET_RPC}"
