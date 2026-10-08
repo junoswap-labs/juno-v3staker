@@ -7,6 +7,9 @@ set -a; . ./.env; set +a
 # Immutable caps, mirroring the UniswapV3Staker already live on KUB mainnet.
 LEAD_TIME=2592000    # 30 days: how far ahead an incentive may be scheduled
 MAX_DURATION=63072000 # 2 years: how long one incentive may run
+# Narrowest stakeable range as a multiple of each pool's tick spacing (audit M-01). 10 means at least
+# 10 spacings wide on every fee tier. 0 = no floor. Immutable once deployed.
+MIN_RANGE_SPACINGS=${MIN_RANGE_SPACINGS:-10}
 
 case "${1:-}" in
   testnet)
@@ -27,4 +30,4 @@ esac
 forge create contracts/JunoswapV3Staker.sol:JunoswapV3Staker \
   --rpc-url "$RPC" --chain "$CHAIN" --private-key "$PRIVATE_KEY" --broadcast --legacy \
   --verify --verifier blockscout --verifier-url "$VERIFIER_URL" \
-  --constructor-args "$FACTORY" "$POSITION_MANAGER" "$LEAD_TIME" "$MAX_DURATION"
+  --constructor-args "$FACTORY" "$POSITION_MANAGER" "$LEAD_TIME" "$MAX_DURATION" "$MIN_RANGE_SPACINGS"

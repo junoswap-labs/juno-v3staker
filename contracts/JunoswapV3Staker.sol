@@ -71,6 +71,8 @@ contract JunoswapV3Staker is IJunoswapV3Staker, Multicall {
     uint256 public immutable override maxIncentiveStartLeadTime;
     /// @inheritdoc IJunoswapV3Staker
     uint256 public immutable override maxIncentiveDuration;
+    /// @inheritdoc IJunoswapV3Staker
+    uint256 public immutable override minRangeSpacings;
 
     /// @dev bytes32 refers to the return value of IncentiveId.compute
     mapping(bytes32 => Incentive) public override incentives;
@@ -88,12 +90,14 @@ contract JunoswapV3Staker is IJunoswapV3Staker, Multicall {
         IUniswapV3Factory _factory,
         INonfungiblePositionManager _nonfungiblePositionManager,
         uint256 _maxIncentiveStartLeadTime,
-        uint256 _maxIncentiveDuration
+        uint256 _maxIncentiveDuration,
+        uint256 _minRangeSpacings
     ) {
         factory = _factory;
         nonfungiblePositionManager = _nonfungiblePositionManager;
         maxIncentiveStartLeadTime = _maxIncentiveStartLeadTime;
         maxIncentiveDuration = _maxIncentiveDuration;
+        minRangeSpacings = _minRangeSpacings;
     }
 
     /// @inheritdoc IJunoswapV3Staker
@@ -414,28 +418,71 @@ contract JunoswapV3Staker is IJunoswapV3Staker, Multicall {
     }
 
     /// @dev Stakes a deposited token without doing an ownership check
-    function _stakeToken(IncentiveKey memory key, uint256 tokenId) private {
-        require(block.timestamp >= key.startTime, 'JunoswapV3Staker::stakeToken: incentive not started');
-        require(block.timestamp < key.endTime, 'JunoswapV3Staker::stakeToken: incentive ended');
+    /// @inheritdoc IJunoswapV3Staker
+    function stakeEligibility(IncentiveKey memory key, uint256 tokenId)
+        external
+        view
+        override
+        returns (bool eligible, string memory reason)
+    {
+        (reason, , , , ) = _eligibility(key, tokenId);
+        eligible = bytes(reason).length == 0;
+    }
+
+    /// @dev Single source of truth for the stake conditions: `_stakeToken` reverts with the very
+    /// string this returns, and `stakeEligibility` exposes it. An empty string means eligible.
+    function _eligibility(IncentiveKey memory key, uint256 tokenId)
+        private
+        view
+        returns (
+            string memory reason,
+            IUniswapV3Pool pool,
+            int24 tickLower,
+            int24 tickUpper,
+            uint128 liquidity
+        )
+    {
+        if (block.timestamp < key.startTime) return ('JunoswapV3Staker::stakeToken: incentive not started', pool, 0, 0, 0);
+        if (block.timestamp >= key.endTime) return ('JunoswapV3Staker::stakeToken: incentive ended', pool, 0, 0, 0);
 
         bytes32 incentiveId = IncentiveId.compute(key);
-        Incentive storage incentive = incentives[incentiveId];
+        if (incentives[incentiveId].totalRewardUnclaimed == 0)
+            return ('JunoswapV3Staker::stakeToken: non-existent incentive', pool, 0, 0, 0);
+        if (stakes[tokenId][incentiveId].liquidity != 0)
+            return ('JunoswapV3Staker::stakeToken: token already staked', pool, 0, 0, 0);
 
-        require(incentive.totalRewardUnclaimed > 0, 'JunoswapV3Staker::stakeToken: non-existent incentive');
-        require(stakes[tokenId][incentiveId].liquidity == 0, 'JunoswapV3Staker::stakeToken: token already staked');
+        (pool, tickLower, tickUpper, liquidity) = NFTPositionInfo.getPositionInfo(
+            factory,
+            nonfungiblePositionManager,
+            tokenId
+        );
 
-        (IUniswapV3Pool pool, int24 tickLower, int24 tickUpper, uint128 liquidity) =
-            NFTPositionInfo.getPositionInfo(factory, nonfungiblePositionManager, tokenId);
-
-        require(pool == key.pool, 'JunoswapV3Staker::stakeToken: token pool is not the incentive pool');
-        require(liquidity > 0, 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity');
+        if (pool != key.pool) reason = 'JunoswapV3Staker::stakeToken: token pool is not the incentive pool';
+        else if (liquidity == 0) reason = 'JunoswapV3Staker::stakeToken: cannot stake token with 0 liquidity';
+        // audit M-01: reward weight is raw liquidity, and liquidity per dollar grows without bound as
+        // a range narrows (2,222x at the 0.01% tier). A width floor keeps the budget on positions that
+        // give usable depth. It is a multiple of the pool's own tick spacing so one number is
+        // meaningful on every fee tier (spacing is 1, 10, 60 and 200 on the standard tiers). 0 disables it.
+        else if (
+            uint256(int256(tickUpper) - int256(tickLower)) <
+            minRangeSpacings.mul(uint256(int256(pool.tickSpacing())))
+        ) reason = 'JunoswapV3Staker::stakeToken: range too narrow';
         // an out of range position earns nothing but still occupies the accumulator's denominator,
         // diluting everyone who is earning, so it must not be let in to begin with
-        require(!_isOutOfRange(pool, tickLower, tickUpper), 'JunoswapV3Staker::stakeToken: position out of range');
+        else if (_isOutOfRange(pool, tickLower, tickUpper)) reason = 'JunoswapV3Staker::stakeToken: position out of range';
         // liquidity per unit of capital is unbounded as a range narrows, so a position far out of
         // range can be minted at maxLiquidityPerTick (1.15e34 at the 0.3% tier) for dust and crush
         // every real staker. The pool's own active liquidity is a market-sized ceiling dust cannot reach.
-        require(liquidity <= pool.liquidity(), 'JunoswapV3Staker::stakeToken: liquidity exceeds pool');
+        else if (liquidity > pool.liquidity()) reason = 'JunoswapV3Staker::stakeToken: liquidity exceeds pool';
+    }
+
+    function _stakeToken(IncentiveKey memory key, uint256 tokenId) private {
+        (string memory reason, IUniswapV3Pool pool, int24 tickLower, int24 tickUpper, uint128 liquidity) =
+            _eligibility(key, tokenId);
+        require(bytes(reason).length == 0, reason);
+
+        bytes32 incentiveId = IncentiveId.compute(key);
+        Incentive storage incentive = incentives[incentiveId];
 
         _accrue(incentive, key);
 
