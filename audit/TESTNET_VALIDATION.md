@@ -36,12 +36,16 @@ lone staker takes the whole drip.
 After `endTime`, `endIncentive` refunded 6.4 tK. Paid plus refund is 10.000000 tK, so nothing is
 lost or over-paid. Claimed balances equalled the owed amounts. NFTs were withdrawn and returned.
 
-## Not covered
+## Not covered on-chain
 
-- Positions leaving the range mid-incentive (uptime scaling) and eviction by a non-owner after the
-  1-hour / 10% rule.
-- More than two stakers, or several NFTs from one owner in the same incentive.
-- Fee-on-transfer reward tokens and reentrancy through reward tokens.
+Covered by Foundry tests with a controllable mock pool instead (`test/JunoswapV3StakerPayouts.t.sol`),
+not by a real pool: uptime scaling and eviction (1 hour / 10% rule), three stakers with two NFTs from
+one owner, a fee-on-transfer reward token, and a reentrant claim from an ERC777-style token. Those
+check the staker's own bookkeeping. They do not show how a real pool's in-range clock behaves.
+
+Still not covered anywhere:
+
+- A real pool's position leaving the range mid-incentive, or a real eviction on testnet.
 - Mainnet. Nothing here was run against KUB mainnet.
 
 ## Things worth knowing
