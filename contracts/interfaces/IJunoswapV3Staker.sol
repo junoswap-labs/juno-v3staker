@@ -40,6 +40,20 @@ interface IJunoswapV3Staker is IERC721Receiver, IMulticall {
     /// @notice The max amount of seconds into the future the incentive startTime can be set
     function maxIncentiveStartLeadTime() external view returns (uint256);
 
+    /// @notice The narrowest position that may be staked, as a multiple of the pool's tick spacing
+    /// (tickUpper - tickLower >= minRangeSpacings * tickSpacing); 0 = no floor
+    function minRangeSpacings() external view returns (uint256);
+
+    /// @notice Whether `tokenId` could be staked into the incentive right now, and if not, why
+    /// @dev Runs exactly the checks `stakeToken` runs, so a revert reason here is the one the stake
+    /// would hit. Does not check ownership or deposit state. Reverts for a token id that does not exist.
+    /// @return eligible True when the stake would pass every condition
+    /// @return reason The revert string of the first failed condition, empty when eligible
+    function stakeEligibility(IncentiveKey memory key, uint256 tokenId)
+        external
+        view
+        returns (bool eligible, string memory reason);
+
     /// @notice Represents a staking incentive
     /// @param incentiveId The ID of the incentive computed from its parameters
     /// @return totalReward The whole reward budget, which drips linearly between start and end time
